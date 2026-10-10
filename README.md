@@ -2,4 +2,4 @@
 
 A Money Counter machine learning project for the Dev 2.0 hackathon.
 
-leaderboard added eventually
+testing git commits
