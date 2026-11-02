@@ -1,11 +1,49 @@
-import { useState } from 'react'
 import heroImg from './assets/hero.png'
 import reactLogo from './assets/react.svg'
 import viteLogo from './assets/vite.svg'
 import './App.css'
 
+//Dawid make sure you have these modules installed so you can import them. If it doesnt run check them
+//I did some work on the backend so just pretty it up ight🫰
+import { useState, useRef, useEffect } from 'react'
+import * as tf from '@tensorflow/tfjs'
+//Decideed on this model for use
+import * as cocoSsd from '@tensorflow-models/coco-ssd'
+
 function App() {
   const [count, setCount] = useState(0)
+
+  //Using useref hook 
+  const videoRef = useRef(null)
+  const canvasRef = useRef(null)
+  const requestRef = useRef(null)
+
+  //Dawid this is on startup
+  useEffect(() => {
+      async function loadModel() {
+        await tf.ready()
+        const loadedModel = await cocoSsd.load()
+        setModel(loadedModel)
+        setLoading(false)
+      }
+      loadModel()
+    }, []) //The brackets on this hook means it only runs once ok, its the condition.
+
+  useEffect(() => {
+    async function startVideo() {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: 'environment', width: 640, height: 480 },
+        })
+
+        if (videoRef.current)
+          videoRef.current.srcObject = stream
+      }
+      //We have the feed so now we can start the video
+      startVideo()
+
+    }, [])
+
+    //Now I just gotta grab the feed and display the result in the jsx below.
 
   return (
     <>
