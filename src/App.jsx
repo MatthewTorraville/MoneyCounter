@@ -47,7 +47,7 @@ async function loadModel() {
       const shape = model.inputs?.[0]?.shape;
 
       if (!shape || shape.length !== 4 || shape[0] !== 1) {
-        throw new Error(`Unexpected model input shape: ${JSON.stringify(shape)}`);
+        throw new Error(`Weird lookin shape: ${JSON.stringify(shape)}`);
       }
 
       if (shape[1] === 3 && shape[2] === INPUT_SIZE && shape[3] === INPUT_SIZE) {
@@ -59,7 +59,7 @@ async function loadModel() {
       ) {
         model.inputLayout = "NHWC";
       } else {
-        throw new Error(`Model expects ${JSON.stringify(shape)}, but this app is set up for 640 × 640 RGB input.`);
+        throw new Error(`Model expects ${JSON.stringify(shape)}, but you got the wrong inpud bud`);
       }
 
       console.log("Model input:", shape);
@@ -78,7 +78,7 @@ function prepareImage(source) {
   const width = source.videoWidth || source.naturalWidth || source.width;
   const height = source.videoHeight || source.naturalHeight || source.height;
 
-  if (!width || !height) throw new Error("The image is not ready.");
+  if (!width || !height) throw new Error("Getin' the image ready...");
 
   const canvas = document.createElement("canvas");
   canvas.width = INPUT_SIZE;
@@ -144,7 +144,7 @@ function suppressDuplicates(detections) {
 function decodeOutput(tensor, image) {
   const [batch, dim1, dim2] = tensor.shape;
   if (batch !== 1 || tensor.shape.length !== 3) {
-    throw new Error(`Unsupported model output: ${JSON.stringify(tensor.shape)}`);
+    throw new Error(`Unsupported output: ${JSON.stringify(tensor.shape)}`);
   }
 
   const channelsFirst = dim1 === 14;
@@ -152,7 +152,7 @@ function decodeOutput(tensor, image) {
   const sixColumns = dim2 === 6;
 
   if (!channelsFirst && !channelsLast && !sixColumns) {
-    throw new Error(`Unsupported model output: ${JSON.stringify(tensor.shape)}. Expected [1,N,14], [1,14,N], or [1,N,6].`);
+    throw new Error(`Unsupported output: ${JSON.stringify(tensor.shape)}. Expected sumin else`);
   }
 
   const data = tensor.dataSync();
@@ -301,7 +301,7 @@ async function detectMoney(model, source) {
         ? Object.keys(output).join(", ")
         : String(output);
       throw new Error(
-        `Could not find a tensor in the model output. Check the browser console. Output type: ${outputDescription}`
+        `. Uh oh... Im cooked.: ${outputDescription}`
       );
     }
 
@@ -349,12 +349,12 @@ export default function App() {
       .then((loaded) => {
         if (!cancelled) {
           setModel(loaded);
-          setModelStatus("Model ready");
+          setModelStatus("We're ready now");
         }
       })
       .catch((error) => {
         console.error(error);
-        if (!cancelled) setModelStatus(`Model error: ${error.message}`);
+        if (!cancelled) setModelStatus(`Uh oh: ${error.message}`);
       });
 
     return () => { cancelled = true; };
@@ -362,7 +362,7 @@ export default function App() {
 
   function choosePhoto(file) {
     if (!file || !file.type.startsWith("image/")) {
-      setMessage("Choose a JPG, PNG, or WEBP image.");
+      setMessage("Choose an image of some kind.");
       return;
     }
 
@@ -400,12 +400,12 @@ export default function App() {
 
       setMessage(
         found.length
-          ? `Found ${found.length} item(s). Estimated total: $${total.toFixed(2)} CAD.`
-          : "No money was detected. Try a clearer photo with the items separated."
+          ? `We found ${found.length} item(s). The total is: $${total.toFixed(2)} CAD.`
+          : "Put something infront of the camera next time !!"
       );
     } catch (error) {
       console.error(error);
-      setMessage(`Detection failed: ${error.message}`);
+      setMessage(`Uh oh: ${error.message}`);
     } finally {
       setBusy(false);
     }
