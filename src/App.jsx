@@ -1,747 +1,627 @@
-import React, { useState, useRef, useEffect, useCallback } from 'react';
-import {
-  Upload,
-  Camera,
-  DollarSign,
-  RotateCcw,
-  Image as ImageIcon,
-  CheckCircle2,
-  AlertCircle,
-  X,
-  Plus,
-  Minus,
-  Loader2,
-} from 'lucide-react';
-import * as tf from '@tensorflow/tfjs';
-import * as cocoSsd from '@tensorflow-models/coco-ssd';
+import { useEffect, useRef, useState } from "react";
+import * as tf from "@tensorflow/tfjs";
+import * as tflite from "@tensorflow/tfjs-tflite";
 
-const CAD_DENOMINATIONS = [
-  { id: 'bill_100', label: '$100 Bill', short: '$100', value: 100.0, type: 'bill', accent: 'bg-amber-500/15 text-amber-500 border-amber-500/30' },
-  { id: 'bill_50',  label: '$50 Bill',  short: '$50',  value: 50.0,  type: 'bill', accent: 'bg-red-500/15 text-red-400 border-red-500/30' },
-  { id: 'bill_20',  label: '$20 Bill',  short: '$20',  value: 20.0,  type: 'bill', accent: 'bg-emerald-500/15 text-emerald-400 border-emerald-500/30' },
-  { id: 'bill_10',  label: '$10 Bill',  short: '$10',  value: 10.0,  type: 'bill', accent: 'bg-purple-500/15 text-purple-400 border-purple-500/30' },
-  { id: 'bill_5',   label: '$5 Bill',   short: '$5',   value: 5.0,   type: 'bill', accent: 'bg-blue-500/15 text-blue-400 border-blue-500/30' },
-  { id: 'coin_2',   label: 'Toonie',    short: '$2',   value: 2.0,   type: 'coin', accent: 'bg-yellow-500/15 text-yellow-400 border-yellow-500/30' },
-  { id: 'coin_1',   label: 'Loonie',    short: '$1',   value: 1.0,   type: 'coin', accent: 'bg-amber-400/15 text-amber-300 border-amber-400/30' },
-  { id: 'coin_025', label: 'Quarter',   short: '25¢',  value: 0.25,  type: 'coin', accent: 'bg-zinc-500/15 text-zinc-400 border-zinc-500/30' },
-  { id: 'coin_010', label: 'Dime',      short: '10¢',  value: 0.1,   type: 'coin', accent: 'bg-zinc-500/15 text-zinc-400 border-zinc-500/30' },
-  { id: 'coin_005', label: 'Nickel',    short: '5¢',   value: 0.05,  type: 'coin', accent: 'bg-zinc-500/15 text-zinc-400 border-zinc-500/30' },
+const MODEL_URL = "/models/cad_money.tflite";
+const INPUT_SIZE = 640;
+const SCORE_THRESHOLD = 0.1;
+const IOU_THRESHOLD = 0.45;
+
+const DENOMINATIONS = [
+  { id: "bill_100", name: "$100 bill", value: 100, type: "Bill" },
+  { id: "bill_50", name: "$50 bill", value: 50, type: "Bill" },
+  { id: "bill_20", name: "$20 bill", value: 20, type: "Bill" },
+  { id: "bill_10", name: "$10 bill", value: 10, type: "Bill" },
+  { id: "bill_5", name: "$5 bill", value: 5, type: "Bill" },
+  { id: "coin_2", name: "Toonie", value: 2, type: "Coin" },
+  { id: "coin_1", name: "Loonie", value: 1, type: "Coin" },
+  { id: "coin_025", name: "Quarter", value: 0.25, type: "Coin" },
+  { id: "coin_010", name: "Dime", value: 0.1, type: "Coin" },
+  { id: "coin_005", name: "Nickel", value: 0.05, type: "Coin" },
 ];
 
-const INITIAL_COUNTS = CAD_DENOMINATIONS.reduce((acc, item) => {
-  acc[item.id] = 0;
-  return acc;
-}, {});
+const CLASS_NAMES = [
+  "$1 coin", "10¢ coin", "$10 bill", "$100 bill", "$2 coin",
+  "$20 bill", "25¢ coin", "5¢ coin", "$5 bill", "$50 bill",
+];
+
+const CLASS_TO_ID = [
+  "coin_1", "coin_010", "bill_10", "bill_100", "coin_2",
+  "bill_20", "coin_025", "coin_005", "bill_5", "bill_50",
+];
+
+const emptyCounts = () =>
+  Object.fromEntries(DENOMINATIONS.map(({ id }) => [id, 0]));
+
+let modelPromise;
+
+async function loadModel() {
+  if (!modelPromise) {
+    modelPromise = (async () => {
+      tflite.setWasmPath(
+        "https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-tflite@0.0.1-alpha.10/wasm/"
+      );
+
+      await tf.ready();
+      const model = await tflite.loadTFLiteModel(MODEL_URL);
+      const shape = model.inputs?.[0]?.shape;
+
+      if (!shape || shape.length !== 4 || shape[0] !== 1) {
+        throw new Error(`Unexpected model input shape: ${JSON.stringify(shape)}`);
+      }
+
+      if (shape[1] === 3 && shape[2] === INPUT_SIZE && shape[3] === INPUT_SIZE) {
+        model.inputLayout = "NCHW";
+      } else if (
+        shape[1] === INPUT_SIZE &&
+        shape[2] === INPUT_SIZE &&
+        shape[3] === 3
+      ) {
+        model.inputLayout = "NHWC";
+      } else {
+        throw new Error(`Model expects ${JSON.stringify(shape)}, but this app is set up for 640 × 640 RGB input.`);
+      }
+
+      console.log("Model input:", shape);
+      console.log("Model output:", model.outputs);
+      return model;
+    })().catch((error) => {
+      modelPromise = null;
+      throw error;
+    });
+  }
+
+  return modelPromise;
+}
+
+function prepareImage(source) {
+  const width = source.videoWidth || source.naturalWidth || source.width;
+  const height = source.videoHeight || source.naturalHeight || source.height;
+
+  if (!width || !height) throw new Error("The image is not ready.");
+
+  const canvas = document.createElement("canvas");
+  canvas.width = INPUT_SIZE;
+  canvas.height = INPUT_SIZE;
+
+  const context = canvas.getContext("2d");
+  context.fillStyle = "rgb(114, 114, 114)";
+  context.fillRect(0, 0, INPUT_SIZE, INPUT_SIZE);
+
+  const scale = Math.min(INPUT_SIZE / width, INPUT_SIZE / height);
+  const resizedWidth = Math.round(width * scale);
+  const resizedHeight = Math.round(height * scale);
+  const padX = (INPUT_SIZE - resizedWidth) / 2;
+  const padY = (INPUT_SIZE - resizedHeight) / 2;
+
+  context.drawImage(
+    source, 0, 0, width, height,
+    padX, padY, resizedWidth, resizedHeight
+  );
+
+  return {
+    canvas,
+    width,
+    height,
+    scale,
+    padX,
+    padY,
+  };
+}
+
+function iou(a, b) {
+  const x1 = Math.max(a.x1, b.x1);
+  const y1 = Math.max(a.y1, b.y1);
+  const x2 = Math.min(a.x2, b.x2);
+  const y2 = Math.min(a.y2, b.y2);
+  const overlap = Math.max(0, x2 - x1) * Math.max(0, y2 - y1);
+  const areaA = (a.x2 - a.x1) * (a.y2 - a.y1);
+  const areaB = (b.x2 - b.x1) * (b.y2 - b.y1);
+  return overlap / (areaA + areaB - overlap || 1);
+}
+
+function suppressDuplicates(detections) {
+  const sorted = [...detections].sort((a, b) => b.score - a.score);
+  const kept = [];
+
+  while (sorted.length && kept.length < 100) {
+    const current = sorted.shift();
+    kept.push(current);
+
+    for (let i = sorted.length - 1; i >= 0; i--) {
+      if (
+        sorted[i].classId === current.classId &&
+        iou(sorted[i], current) > IOU_THRESHOLD
+      ) {
+        sorted.splice(i, 1);
+      }
+    }
+  }
+
+  return kept;
+}
+
+function decodeOutput(tensor, image) {
+  const [batch, dim1, dim2] = tensor.shape;
+  if (batch !== 1 || tensor.shape.length !== 3) {
+    throw new Error(`Unsupported model output: ${JSON.stringify(tensor.shape)}`);
+  }
+
+  const channelsFirst = dim1 === 14;
+  const channelsLast = dim2 === 14;
+  const sixColumns = dim2 === 6;
+
+  if (!channelsFirst && !channelsLast && !sixColumns) {
+    throw new Error(`Unsupported model output: ${JSON.stringify(tensor.shape)}. Expected [1,N,14], [1,14,N], or [1,N,6].`);
+  }
+
+  const data = tensor.dataSync();
+  const candidateCount = channelsFirst ? dim2 : dim1;
+
+  const read = (candidate, channel) =>
+    channelsFirst
+      ? data[channel * candidateCount + candidate]
+      : data[candidate * dim2 + channel];
+
+  const detections = [];
+
+  for (let i = 0; i < candidateCount; i++) {
+    let x1, y1, x2, y2, score, classId;
+
+    if (sixColumns) {
+      // Assumes rows are [x1, y1, x2, y2, confidence, classId].
+      x1 = read(i, 0);
+      y1 = read(i, 1);
+      x2 = read(i, 2);
+      y2 = read(i, 3);
+      score = read(i, 4);
+      classId = Math.round(read(i, 5));
+    } else {
+      // Assumes YOLO rows are [centerX, centerY, width, height, 10 class scores].
+      const centerX = read(i, 0);
+      const centerY = read(i, 1);
+      const boxWidth = read(i, 2);
+      const boxHeight = read(i, 3);
+
+      score = -Infinity;
+      classId = -1;
+
+      for (let c = 0; c < CLASS_NAMES.length; c++) {
+        const classScore = read(i, c + 4);
+        if (classScore > score) {
+          score = classScore;
+          classId = c;
+        }
+      }
+
+      x1 = centerX - boxWidth / 2;
+      y1 = centerY - boxHeight / 2;
+      x2 = centerX + boxWidth / 2;
+      y2 = centerY + boxHeight / 2;
+    }
+
+    if (
+      !Number.isFinite(score) ||
+      score < SCORE_THRESHOLD ||
+      classId < 0 ||
+      classId >= CLASS_TO_ID.length
+    ) continue;
+
+    // Convert normalized coordinates to model pixels when necessary.
+    if (Math.max(Math.abs(x1), Math.abs(y1), Math.abs(x2), Math.abs(y2)) <= 1.5) {
+      x1 *= INPUT_SIZE;
+      y1 *= INPUT_SIZE;
+      x2 *= INPUT_SIZE;
+      y2 *= INPUT_SIZE;
+    }
+
+    // Remove the letterbox padding and map boxes to the original photo.
+    const left = Math.max(0, Math.min(image.width, (x1 - image.padX) / image.scale));
+    const top = Math.max(0, Math.min(image.height, (y1 - image.padY) / image.scale));
+    const right = Math.max(0, Math.min(image.width, (x2 - image.padX) / image.scale));
+    const bottom = Math.max(0, Math.min(image.height, (y2 - image.padY) / image.scale));
+
+    if (right <= left || bottom <= top) continue;
+
+    detections.push({
+      classId,
+      currencyId: CLASS_TO_ID[classId],
+      className: CLASS_NAMES[classId],
+      score,
+      box: { left, top, width: right - left, height: bottom - top },
+      x1: left,
+      y1: top,
+      x2: right,
+      y2: bottom,
+    });
+  }
+
+  return suppressDuplicates(detections);
+}
+
+function findOutputTensor(value) {
+  if (value && Array.isArray(value.shape) && typeof value.dataSync === "function") {
+    return value;
+  }
+
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const tensor = findOutputTensor(item);
+      if (tensor) return tensor;
+    }
+  }
+
+  if (value && typeof value === "object") {
+    for (const item of Object.values(value)) {
+      const tensor = findOutputTensor(item);
+      if (tensor) return tensor;
+    }
+  }
+
+  return null;
+}
+
+function disposeOutput(value) {
+  if (!value) return;
+
+  if (typeof value.dispose === "function") {
+    value.dispose();
+    return;
+  }
+
+  if (Array.isArray(value)) {
+    value.forEach(disposeOutput);
+    return;
+  }
+
+  if (typeof value === "object") {
+    Object.values(value).forEach(disposeOutput);
+  }
+}
+
+async function detectMoney(model, source) {
+  const image = prepareImage(source);
+  let input;
+  let output;
+  let adjustedOutput;
+
+  try {
+    input = tf.tidy(() => {
+      const pixels = tf.browser.fromPixels(image.canvas).toFloat().div(255).expandDims(0);
+      return model.inputLayout === "NCHW"
+        ? pixels.transpose([0, 3, 1, 2])
+        : pixels;
+    });
+
+    output = model.predict(input);
+    let result = findOutputTensor(output);
+
+    if (!result) {
+      const outputDescription = output && typeof output === "object"
+        ? Object.keys(output).join(", ")
+        : String(output);
+      throw new Error(
+        `Could not find a tensor in the model output. Check the browser console. Output type: ${outputDescription}`
+      );
+    }
+
+    // Some exports add extra dimensions, such as [1, 1, N, 6].
+    // Remove singleton dimensions until the output is three-dimensional.
+    while (result.shape.length > 3) {
+      const axis = result.shape.findIndex((size, index) => index > 0 && size === 1);
+      if (axis === -1) {
+        throw new Error(`Unsupported model output shape: ${JSON.stringify(result.shape)}`);
+      }
+
+      const next = tf.squeeze(result, [axis]);
+      if (adjustedOutput) adjustedOutput.dispose();
+      adjustedOutput = next;
+      result = adjustedOutput;
+    }
+
+    console.log("Model output shape:", result.shape);
+    return decodeOutput(result, image);
+  } finally {
+    input?.dispose();
+    adjustedOutput?.dispose();
+    disposeOutput(output);
+  }
+}
 
 export default function App() {
-  // Theme state
-  const [theme, setTheme] = useState('dark');
-  const isDark = theme === 'dark';
-
-  // TensorFlow / COCO-SSD model state (fixed missing state hooks from backend snippet)
   const [model, setModel] = useState(null);
-  const [isModelLoading, setIsModelLoading] = useState(true);
-
-  // Media & Camera state
-  const [imageDataUrl, setImageDataUrl] = useState(null);
-  const [fileName, setFileName] = useState('');
-  const [isDragging, setIsDragging] = useState(false);
-  const [isCameraOpen, setIsCameraOpen] = useState(false);
-  const [isProcessing, setIsProcessing] = useState(false);
+  const [modelStatus, setModelStatus] = useState("Loading model…");
+  const [photo, setPhoto] = useState(null);
+  const [fileName, setFileName] = useState("");
+  const [counts, setCounts] = useState(emptyCounts);
   const [detections, setDetections] = useState([]);
+  const [message, setMessage] = useState("");
+  const [busy, setBusy] = useState(false);
 
-  // Currency counts state
-  const [counts, setCounts] = useState(INITIAL_COUNTS);
-  const [status, setStatus] = useState(null);
+  const imageRef = useRef(null);
+  const fileRef = useRef(null);
+  const captureRef = useRef(null);
 
-  // Refs
-  const fileInputRef = useRef(null);
-  const videoRef = useRef(null);
-  const streamRef = useRef(null);
-  const previewImgRef = useRef(null);
-  const overlayCanvasRef = useRef(null);
-  const requestRef = useRef(null);
-
-  // Load TensorFlow.js & COCO-SSD on startup
   useEffect(() => {
     let cancelled = false;
-    async function loadModel() {
-      try {
-        await tf.ready();
-        const loadedModel = await cocoSsd.load();
+
+    loadModel()
+      .then((loaded) => {
         if (!cancelled) {
-          setModel(loadedModel);
-          setIsModelLoading(false);
+          setModel(loaded);
+          setModelStatus("Model ready");
         }
-      } catch (err) {
-        if (!cancelled) {
-          setIsModelLoading(false);
-          setStatus({ type: 'error', text: 'Failed to load TensorFlow COCO-SSD model.' });
-        }
-      }
-    }
-    loadModel();
-    return () => {
-      cancelled = true;
-    };
+      })
+      .catch((error) => {
+        console.error(error);
+        if (!cancelled) setModelStatus(`Model error: ${error.message}`);
+      });
+
+    return () => { cancelled = true; };
   }, []);
 
-  // Draw bounding boxes on canvas (works for both uploaded images and live video)
-  const drawDetectionsOnCanvas = useCallback((preds, sourceWidth, sourceHeight) => {
-    const canvas = overlayCanvasRef.current;
-    if (!canvas || !sourceWidth || !sourceHeight) return;
-
-    const rect = canvas.getBoundingClientRect();
-    canvas.width = rect.width || sourceWidth;
-    canvas.height = rect.height || sourceHeight;
-
-    const scaleX = canvas.width / sourceWidth;
-    const scaleY = canvas.height / sourceHeight;
-
-    const ctx = canvas.getContext('2d');
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-    preds.forEach((pred) => {
-      const [rawX, rawY, rawW, rawH] = pred.bbox;
-      const x = rawX * scaleX;
-      const y = rawY * scaleY;
-      const w = rawW * scaleX;
-      const h = rawH * scaleY;
-
-      ctx.strokeStyle = '#22c55e';
-      ctx.lineWidth = 2.5;
-      ctx.strokeRect(x, y, w, h);
-
-      const labelText = `${pred.class} ${(pred.score * 100).toFixed(0)}%`;
-      ctx.font = '600 12px Inter, system-ui, sans-serif';
-      const textWidth = ctx.measureText(labelText).width;
-
-      ctx.fillStyle = '#16a34a';
-      ctx.fillRect(x, Math.max(0, y - 20), textWidth + 10, 20);
-
-      ctx.fillStyle = '#ffffff';
-      ctx.fillText(labelText, x + 5, Math.max(14, y - 6));
-    });
-  }, []);
-
-  // Redraw static image boxes on window resize
-  useEffect(() => {
-    if (isCameraOpen || !previewImgRef.current) return;
-    const handleResize = () => {
-      const img = previewImgRef.current;
-      if (img && detections.length > 0) {
-        drawDetectionsOnCanvas(detections, img.naturalWidth, img.naturalHeight);
-      }
-    };
-    handleResize();
-    window.addEventListener('resize', handleResize);
-    return () => window.removeEventListener('resize', handleResize);
-  }, [detections, imageDataUrl, isCameraOpen, drawDetectionsOnCanvas]);
-
-  // Stop webcam & animation loop cleanly
-  const stopCamera = useCallback(() => {
-    if (requestRef.current) {
-      cancelAnimationFrame(requestRef.current);
-      requestRef.current = null;
-    }
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach((track) => track.stop());
-      streamRef.current = null;
-    }
-    if (videoRef.current) {
-      videoRef.current.srcObject = null;
-    }
-    setIsCameraOpen(false);
-  }, []);
-
-  useEffect(() => {
-    return () => stopCamera();
-  }, [stopCamera]);
-
-  // Real-time detection loop while camera is live
-  useEffect(() => {
-    if (!isCameraOpen || !model) return;
-    let active = true;
-
-    const detectFrame = async () => {
-      if (!active) return;
-      const video = videoRef.current;
-      if (video && video.readyState === 4) {
-        const preds = await model.detect(video);
-        if (active) {
-          setDetections(preds);
-          drawDetectionsOnCanvas(preds, video.videoWidth, video.videoHeight);
-        }
-      }
-      if (active) {
-        requestRef.current = requestAnimationFrame(detectFrame);
-      }
-    };
-
-    requestRef.current = requestAnimationFrame(detectFrame);
-    return () => {
-      active = false;
-      if (requestRef.current) cancelAnimationFrame(requestRef.current);
-    };
-  }, [isCameraOpen, model, drawDetectionsOnCanvas]);
-
-  // Load uploaded image file
-  const loadImageFile = (file) => {
-    if (!file || !file.type.startsWith('image/')) {
-      setStatus({ type: 'error', text: 'Please select a valid image file (PNG, JPG, WEBP).' });
+  function choosePhoto(file) {
+    if (!file || !file.type.startsWith("image/")) {
+      setMessage("Choose a JPG, PNG, or WEBP image.");
       return;
     }
-    stopCamera();
+
+    setPhoto(URL.createObjectURL(file));
     setFileName(file.name);
     setDetections([]);
+    setCounts(emptyCounts());
+    setMessage("");
+  }
 
-    const reader = new FileReader();
-    reader.onload = (e) => {
-      setImageDataUrl(e.target.result);
-      setStatus({ type: 'info', text: `Loaded "${file.name}". Click COUNT MONEY to run detection.` });
-    };
-    reader.readAsDataURL(file);
-  };
-
-  // Start live camera when user clicks "Use Camera"
-  const handleStartCamera = async () => {
-    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-      setStatus({ type: 'error', text: 'Camera access is not supported in this browser.' });
+  async function countMoney() {
+    if (!model || !imageRef.current) {
+      setMessage("Load a photo and wait for the model to finish loading.");
       return;
     }
 
+    setBusy(true);
+    setMessage("");
+
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: { ideal: 'environment' }, width: { ideal: 640 }, height: { ideal: 480 } },
-        audio: false,
+      const found = await detectMoney(model, imageRef.current);
+      const nextCounts = emptyCounts();
+
+      found.forEach(({ currencyId }) => {
+        if (currencyId in nextCounts) nextCounts[currencyId]++;
       });
-      streamRef.current = stream;
-      setImageDataUrl(null);
-      setFileName('');
-      setDetections([]);
-      setIsCameraOpen(true);
-      setStatus({ type: 'info', text: 'Camera live. Live COCO-SSD detection is active—or click Capture Photo.' });
-    } catch (err) {
-      setStatus({ type: 'error', text: 'Camera permission denied or unavailable. Use Import Image instead.' });
-    }
-  };
 
-  useEffect(() => {
-    if (isCameraOpen && videoRef.current && streamRef.current) {
-      videoRef.current.srcObject = streamRef.current;
-      videoRef.current.play().catch(() => {});
-    }
-  }, [isCameraOpen]);
+      setDetections(found);
+      setCounts(nextCounts);
 
-  // Capture still photo from live video
-  const handleCapturePhoto = () => {
-    const video = videoRef.current;
-    if (!video) return;
+      const total = DENOMINATIONS.reduce(
+        (sum, item) => sum + nextCounts[item.id] * item.value,
+        0
+      );
 
-    const tempCanvas = document.createElement('canvas');
-    tempCanvas.width = video.videoWidth || 640;
-    tempCanvas.height = video.videoHeight || 480;
-    const ctx = tempCanvas.getContext('2d');
-    ctx.drawImage(video, 0, 0, tempCanvas.width, tempCanvas.height);
-
-    const capturedDataUrl = tempCanvas.toDataURL('image/png');
-    stopCamera();
-    setImageDataUrl(capturedDataUrl);
-    setFileName('camera-capture.png');
-    setStatus({ type: 'info', text: 'Photo captured! Click COUNT MONEY to scan it.' });
-  };
-
-  // Run COCO-SSD detection on the uploaded/captured image
-  const handleCountMoney = async () => {
-    if (!model) {
-      setStatus({ type: 'info', text: 'Model is still loading—wait a moment and try again.' });
-      return;
-    }
-    if (!imageDataUrl && !isCameraOpen) {
-      setStatus({ type: 'error', text: 'Please import an image or open the camera first.' });
-      return;
-    }
-
-    setIsProcessing(true);
-    try {
-      const targetEl = isCameraOpen ? videoRef.current : previewImgRef.current;
-      if (!targetEl) return;
-
-      const preds = await model.detect(targetEl);
-      setDetections(preds);
-
-      if (!isCameraOpen) {
-        drawDetectionsOnCanvas(preds, targetEl.naturalWidth, targetEl.naturalHeight);
-      }
-
-      const summary =
-        preds.length > 0
-          ? `Detected ${preds.length} object(s): ${preds.map((p) => `${p.class} (${(p.score * 100).toFixed(0)}%)`).join(', ')}`
-          : 'No objects detected by COCO-SSD. (Note: standard COCO-SSD detects 80 general objects—swap in a custom CAD currency model to auto-fill counts!)';
-
-      setStatus({ type: preds.length > 0 ? 'success' : 'info', text: summary });
-    } catch (err) {
-      setStatus({ type: 'error', text: 'Error running TensorFlow detection.' });
+      setMessage(
+        found.length
+          ? `Found ${found.length} item(s). Estimated total: $${total.toFixed(2)} CAD.`
+          : "No money was detected. Try a clearer photo with the items separated."
+      );
+    } catch (error) {
+      console.error(error);
+      setMessage(`Detection failed: ${error.message}`);
     } finally {
-      setIsProcessing(false);
+      setBusy(false);
     }
-  };
+  }
 
-  const adjustCount = (id, delta) => {
-    setCounts((prev) => ({
-      ...prev,
-      [id]: Math.max(0, (prev[id] || 0) + delta),
+  function changeCount(id, amount) {
+    setCounts((current) => ({
+      ...current,
+      [id]: Math.max(0, current[id] + amount),
     }));
-  };
+  }
 
-  const handleReset = () => {
-    setCounts(INITIAL_COUNTS);
+  function resetCounts() {
+    setCounts(emptyCounts());
     setDetections([]);
-    const canvas = overlayCanvasRef.current;
-    if (canvas) {
-      const ctx = canvas.getContext('2d');
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
-    }
-    setStatus({ type: 'info', text: 'Tally reset to $0.00 CAD.' });
-  };
+    setMessage("Count reset.");
+  }
 
-  const billsSubtotal = CAD_DENOMINATIONS.filter((d) => d.type === 'bill').reduce(
-    (sum, d) => sum + (counts[d.id] || 0) * d.value,
+  const total = DENOMINATIONS.reduce(
+    (sum, item) => sum + counts[item.id] * item.value,
     0
   );
-  const coinsSubtotal = CAD_DENOMINATIONS.filter((d) => d.type === 'coin').reduce(
-    (sum, d) => sum + (counts[d.id] || 0) * d.value,
-    0
-  );
-  const grandTotal = billsSubtotal + coinsSubtotal;
 
   return (
-    <div
-      className={`min-h-screen transition-colors duration-200 font-sans flex flex-col items-center ${
-        isDark ? 'dark bg-[#050505] text-white' : 'light bg-[#f8fafc] text-slate-900'
-      }`}
-    >
+    <>
       <style>{`
-        @import url('https://fonts.googleapis.com/css2?family=Fredoka:wght@600;700&display=swap');
-        .font-brand { font-family: 'Fredoka', system-ui, sans-serif; }
+        * { box-sizing: border-box; }
+        body {
+          margin: 0;
+          min-height: 100vh;
+          background: #151715;
+          color: #eeeeeb;
+          font-family: Arial, Helvetica, sans-serif;
+        }
+        button, input { font: inherit; }
+        button {
+          padding: 9px 13px;
+          border: 1px solid #414641;
+          border-radius: 4px;
+          background: #292d29;
+          color: #eeeeeb;
+          cursor: pointer;
+        }
+        button:hover { background: #353a35; }
+        button:disabled { opacity: .5; cursor: not-allowed; }
+        button:focus-visible { outline: 2px solid #8ab99a; outline-offset: 2px; }
+        .app { width: min(960px, calc(100% - 32px)); margin: 36px auto; }
+        header { margin-bottom: 24px; }
+        h1 { margin: 0 0 3px; font-family: Georgia, "Times New Roman", serif; font-size: 46px; line-height: 1.08; font-weight: 500; letter-spacing: -1px; }
+        header p { margin: 0 0 8px; line-height: 1.4; color: #a5aaa5; }
+        header small { color: #91b99a; }
+        .controls { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
+        .controls input { display: none; }
+        .controls button:last-child { background: #779b80; color: #101710; border-color: #779b80; }
+        .controls button:last-child:hover { background: #89aa91; }
+        .workspace { display: grid; grid-template-columns: 1.3fr 1fr; gap: 14px; }
+        .preview, .results {
+          min-width: 0;
+          padding: 16px;
+          background: #1d211d;
+          border: 1px solid #343934;
+          border-radius: 5px;
+        }
+        .preview {
+          min-height: 350px;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          flex-direction: column;
+          overflow: hidden;
+        }
+        .image-wrap { position: relative; display: inline-block; max-width: 100%; line-height: 0; }
+        .preview img { display: block; max-width: 100%; max-height: 500px; object-fit: contain; }
+        .detection-boxes { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+        .detection-box { fill: none; stroke: #80bd8d; stroke-width: 3; vector-effect: non-scaling-stroke; }
+        .detection-label {
+          fill: #b1d9b9;
+          font-size: 22px;
+          font-weight: 600;
+          stroke: #151715;
+          stroke-width: 4px;
+          paint-order: stroke;
+          stroke-linejoin: round;
+        }
+        .preview p, .hint { color: #a5aaa5; font-size: 13px; line-height: 1.5; overflow-wrap: anywhere; }
+        .results { padding: 16px; }
+        .total { padding-bottom: 16px; border-bottom: 1px solid #343934; }
+        .total span { color: #a5aaa5; font-size: 13px; }
+        .total strong { display: block; margin-top: 6px; color: #a8d2b0; font-size: 32px; font-weight: 600; font-variant-numeric: tabular-nums; }
+        h2 { margin: 18px 0 8px; font-size: 14px; font-weight: 600; }
+        .count-row { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 8px 0; border-bottom: 1px solid #303530; font-size: 14px; }
+        .count-row > div { display: flex; align-items: center; gap: 9px; }
+        .count-row button { width: 28px; height: 28px; padding: 0; }
+        .count-row strong { min-width: 18px; text-align: center; font-variant-numeric: tabular-nums; }
+        .reset { margin-top: 16px; }
+        .message { margin-top: 14px; padding: 10px 12px; color: #b9d7c0; background: #202820; border: 1px solid #3c5141; border-radius: 4px; font-size: 13px; line-height: 1.5; }
+        @media (max-width: 680px) {
+          .app { margin: 26px auto; }
+          h1 { font-size: 38px; }
+          .workspace { grid-template-columns: 1fr; }
+          .preview { min-height: 260px; }
+          .controls button { flex: 1 1 calc(50% - 8px); }
+        }
       `}</style>
-
-      {/* TOP-CENTER GREEN THEME TOGGLE */}
-      <header className="w-full flex justify-center">
-        <button
-          type="button"
-          onClick={() => setTheme(isDark ? 'light' : 'dark')}
-          className="bg-[#16a34a] hover:bg-[#22c55e] active:bg-[#15803d] text-white font-semibold text-sm px-5 py-2 rounded-b-xl shadow-md transition-all cursor-pointer tracking-wide"
-        >
-          {isDark ? 'Light Theme' : 'Dark Theme'}
-        </button>
+      <main className="app">
+      <header>
+        <h1>Canadian Money Counter</h1>
+        <p>From the Looney Toonies for the DEV 2.0 Hackathon</p>
+        <small>{modelStatus}</small>
       </header>
 
-      <main className="w-full max-w-4xl px-4 sm:px-6 pt-10 sm:pt-14 pb-16 flex flex-col items-center">
-        {/* LOGO HEADER */}
-        <div className="flex items-center justify-center gap-3 sm:gap-4 mb-4 select-none">
-          <div className="w-12 h-12 sm:w-14 sm:h-14 rounded-full bg-[#16a34a] flex items-center justify-center shadow-lg shadow-[#16a34a]/25 shrink-0">
-            <svg
-              className="w-7 h-7 sm:w-8 sm:h-8 text-[#050505]"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2.5"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            >
-              <path d="M3 12a9 9 0 0 1 15-6.7L21 8" />
-              <path d="M21 3v5h-5" />
-              <path d="M21 12a9 9 0 0 1-15 6.7L3 16" />
-              <path d="M8 16H3v5" />
-              <path d="M12 7.5v9" />
-              <path d="M14.5 9.5a2 2 0 0 0-2-1.5h-1a2 2 0 0 0 0 4h1a2 2 0 0 1 0 4h-1a2 2 0 0 1-2-1.5" />
-            </svg>
-          </div>
+      <section className="controls">
+        <input
+          ref={fileRef}
+          type="file"
+          accept="image/*"
+          onChange={(event) => {
+            choosePhoto(event.target.files?.[0]);
+            event.target.value = "";
+          }}
+        />
+        <input
+          ref={captureRef}
+          type="file"
+          accept="image/*"
+          capture="environment"
+          onChange={(event) => {
+            choosePhoto(event.target.files?.[0]);
+            event.target.value = "";
+          }}
+        />
+        <button onClick={() => fileRef.current?.click()}>Choose photo</button>
+        <button onClick={() => captureRef.current?.click()}>Capture photo</button>
+        <button onClick={countMoney} disabled={!model || !photo || busy}>
+          {busy ? "Counting…" : "Count money"}
+        </button>
+      </section>
 
-          <h1 className="font-brand text-3xl sm:text-5xl font-bold tracking-tight flex items-center">
-            <span className={isDark ? 'text-white' : 'text-slate-900'}>MONEY</span>
-            <span className="text-[#16a34a]">COUNTER</span>
-          </h1>
-        </div>
-
-        {/* MODEL STATUS BADGE */}
-        <div className="mb-8">
-          <span
-            className={`inline-flex items-center gap-2 px-3 py-1 rounded-full text-xs font-medium border ${
-              isModelLoading
-                ? 'border-amber-500/30 bg-amber-500/10 text-amber-400'
-                : 'border-[#16a34a]/30 bg-[#16a34a]/10 text-[#22c55e]'
-            }`}
-          >
-            {isModelLoading ? (
-              <>
-                <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                Loading TensorFlow COCO-SSD model...
-              </>
-            ) : (
-              <>
-                <CheckCircle2 className="w-3.5 h-3.5" />
-                COCO-SSD Vision Model Ready
-              </>
-            )}
-          </span>
-        </div>
-
-        {/* ACTION BAR */}
-        <section aria-label="Currency Input Actions" className="w-full max-w-3xl">
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept="image/*"
-            className="hidden"
-            onChange={(e) => {
-              if (e.target.files?.[0]) loadImageFile(e.target.files[0]);
-              e.target.value = '';
-            }}
-          />
-
-          <div className="flex flex-col md:flex-row items-stretch md:items-end justify-center gap-3 sm:gap-4">
-            {/* Import Image Button */}
-            <div className="flex-1 flex flex-col">
-              <span className={`text-xs sm:text-sm font-medium mb-1.5 ${isDark ? 'text-zinc-200' : 'text-slate-700'}`}>
-                Import Currency Photo
-              </span>
-              <button
-                type="button"
-                onClick={() => fileInputRef.current?.click()}
-                className={`h-12 px-4 rounded-lg font-medium text-sm sm:text-base flex items-center justify-between gap-3 border transition cursor-pointer ${
-                  isDark
-                    ? 'bg-white text-zinc-800 border-transparent hover:bg-zinc-100'
-                    : 'bg-white text-slate-800 border-slate-300 hover:bg-slate-50 shadow-sm'
-                }`}
-              >
-                <span className={`truncate ${fileName ? 'text-zinc-900 font-semibold' : 'text-zinc-500'}`}>
-                  {fileName || 'Select image or drop below...'}
-                </span>
-                <span className="inline-flex items-center gap-1.5 text-[#16a34a] font-semibold shrink-0">
-                  <Upload className="w-4 h-4" />
-                  Import Image
-                </span>
-              </button>
+      <section className="workspace">
+        <div className="preview">
+          {photo ? (
+            <div className="image-wrap">
+              <img
+                ref={imageRef}
+                src={photo}
+                alt="Selected Canadian currency"
+                onLoad={() => setMessage("")}
+              />
+              {detections.length > 0 && imageRef.current && (
+                <svg
+                  className="detection-boxes"
+                  viewBox={`0 0 ${imageRef.current.naturalWidth} ${imageRef.current.naturalHeight}`}
+                  preserveAspectRatio="none"
+                  aria-label="Detected money marked with boxes"
+                >
+                  {detections.map((item, index) => (
+                    <g key={`${item.currencyId}-${index}`}>
+                      <rect
+                        className="detection-box"
+                        x={item.box.left}
+                        y={item.box.top}
+                        width={item.box.width}
+                        height={item.box.height}
+                      />
+                      <text
+                        className="detection-label"
+                        x={item.box.left + 5}
+                        y={Math.max(24, item.box.top - 7)}
+                      >
+                        {item.className}
+                      </text>
+                    </g>
+                  ))}
+                </svg>
+              )}
             </div>
-
-            {/* Use Camera Button */}
-            <div className="flex flex-col md:w-44">
-              <span className={`text-xs sm:text-sm font-medium mb-1.5 ${isDark ? 'text-zinc-200' : 'text-slate-700'}`}>
-                Live Capture
-              </span>
-              <button
-                type="button"
-                onClick={isCameraOpen ? stopCamera : handleStartCamera}
-                className={`h-12 px-4 rounded-lg border font-medium text-sm sm:text-base flex items-center justify-center gap-2 transition cursor-pointer ${
-                  isCameraOpen
-                    ? 'bg-red-600/15 border-red-500 text-red-500 hover:bg-red-600/25'
-                    : isDark
-                    ? 'bg-[#0a0a0a] border-zinc-700 text-white hover:border-[#22c55e]'
-                    : 'bg-white border-slate-300 text-slate-900 hover:border-[#16a34a] shadow-sm'
-                }`}
-              >
-                <Camera className="w-4 h-4 text-[#16a34a]" />
-                <span>{isCameraOpen ? 'Stop Camera' : 'Use Camera'}</span>
-              </button>
-            </div>
-
-            {/* Primary Green COUNT MONEY Button */}
-            <div className="flex flex-col">
-              <span className="hidden md:block text-xs sm:text-sm font-medium text-transparent select-none mb-1.5">
-                Count
-              </span>
-              <button
-                type="button"
-                onClick={handleCountMoney}
-                disabled={isProcessing || isModelLoading}
-                className="h-12 px-6 rounded-lg bg-[#16a34a] hover:bg-[#22c55e] active:bg-[#15803d] disabled:opacity-60 text-white font-bold text-sm sm:text-base tracking-wide uppercase flex items-center justify-center gap-2 shadow-md shadow-[#16a34a]/25 transition cursor-pointer shrink-0"
-              >
-                <DollarSign className="w-5 h-5 stroke-[2.5]" />
-                <span>{isProcessing ? 'SCANNING...' : 'COUNT MONEY'}</span>
-              </button>
-            </div>
-          </div>
-
-          {/* Status Banner */}
-          {status && (
-            <div
-              role="status"
-              className={`mt-4 px-4 py-2.5 rounded-lg border text-sm font-medium flex items-center justify-between gap-3 ${
-                status.type === 'error'
-                  ? 'bg-red-500/10 border-red-500/40 text-red-500'
-                  : status.type === 'success'
-                  ? 'bg-[#16a34a]/15 border-[#16a34a]/40 text-[#22c55e]'
-                  : isDark
-                  ? 'bg-zinc-900 border-zinc-800 text-zinc-300'
-                  : 'bg-white border-slate-200 text-slate-700'
-              }`}
-            >
-              <div className="flex items-center gap-2">
-                {status.type === 'error' ? (
-                  <AlertCircle className="w-4 h-4 shrink-0" />
-                ) : (
-                  <CheckCircle2 className="w-4 h-4 shrink-0 text-[#16a34a]" />
-                )}
-                <span>{status.text}</span>
-              </div>
-              <button
-                type="button"
-                onClick={() => setStatus(null)}
-                aria-label="Dismiss message"
-                className="opacity-70 hover:opacity-100 cursor-pointer"
-              >
-                <X className="w-4 h-4" />
-              </button>
-            </div>
+          ) : (
+            <p>Select or capture a photo to get started.</p>
           )}
-        </section>
+          {fileName && <p>{fileName}</p>}
+        </div>
 
-        {/* PREVIEW CANVAS & CURRENCY BREAKDOWN */}
-        <section className="w-full max-w-3xl mt-8 grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-          {/* Image / Camera Preview Card */}
-          <div className="lg:col-span-7 flex flex-col">
-            <div
-              onDragOver={(e) => {
-                e.preventDefault();
-                setIsDragging(true);
-              }}
-              onDragLeave={() => setIsDragging(false)}
-              onDrop={(e) => {
-                e.preventDefault();
-                setIsDragging(false);
-                if (e.dataTransfer.files?.[0]) loadImageFile(e.dataTransfer.files[0]);
-              }}
-              className={`relative w-full min-h-[290px] sm:min-h-[350px] rounded-xl border-2 border-dashed flex flex-col items-center justify-center overflow-hidden transition-colors ${
-                isDragging
-                  ? 'border-[#22c55e] bg-[#16a34a]/10'
-                  : isDark
-                  ? 'bg-[#0d0d0d] border-zinc-800 hover:border-[#16a34a]/70'
-                  : 'bg-white border-slate-300 hover:border-[#16a34a]'
-              }`}
-            >
-              {!isCameraOpen && !imageDataUrl && (
-                <div
-                  onClick={() => fileInputRef.current?.click()}
-                  className="p-6 text-center flex flex-col items-center justify-center cursor-pointer select-none"
-                >
-                  <div className="w-12 h-12 rounded-full bg-[#16a34a]/15 text-[#16a34a] flex items-center justify-center mb-3">
-                    <ImageIcon className="w-6 h-6" />
-                  </div>
-                  <p className="text-sm sm:text-base font-semibold">
-                    Drag &amp; drop a photo here, or click to browse
-                  </p>
-                  <p className={`text-xs mt-1 ${isDark ? 'text-zinc-400' : 'text-slate-500'}`}>
-                    Supports Canadian bills ($5–$100) and coins (5¢–$2)
-                  </p>
-                </div>
-              )}
-
-              {isCameraOpen && (
-                <div className="relative flex items-center justify-center w-full bg-black">
-                  <video
-                    ref={videoRef}
-                    autoPlay
-                    playsInline
-                    muted
-                    className="w-full max-h-[400px] object-contain block"
-                  />
-                  <canvas
-                    ref={overlayCanvasRef}
-                    className="pointer-events-none absolute inset-0 w-full h-full"
-                  />
-                </div>
-              )}
-
-              {!isCameraOpen && imageDataUrl && (
-                <div className="relative flex items-center justify-center w-full">
-                  <img
-                    ref={previewImgRef}
-                    src={imageDataUrl}
-                    alt="Currency preview"
-                    className="max-w-full max-h-[400px] w-auto h-auto object-contain block"
-                  />
-                  <canvas
-                    ref={overlayCanvasRef}
-                    className="pointer-events-none absolute inset-0 w-full h-full"
-                  />
-                </div>
-              )}
-            </div>
-
-            {isCameraOpen && (
-              <div className="mt-3 flex items-center justify-center gap-3">
-                <button
-                  type="button"
-                  onClick={handleCapturePhoto}
-                  className="px-5 py-2.5 rounded-lg bg-[#16a34a] hover:bg-[#22c55e] text-white font-semibold text-sm flex items-center gap-2 shadow-sm cursor-pointer transition"
-                >
-                  <Camera className="w-4 h-4" />
-                  Capture Photo
-                </button>
-                <button
-                  type="button"
-                  onClick={stopCamera}
-                  className={`px-4 py-2.5 rounded-lg font-semibold text-sm border cursor-pointer transition ${
-                    isDark
-                      ? 'bg-zinc-900 border-zinc-700 text-zinc-300 hover:bg-zinc-800'
-                      : 'bg-white border-slate-300 text-slate-700 hover:bg-slate-100'
-                  }`}
-                >
-                  Cancel
-                </button>
-              </div>
-            )}
-
-            {!isCameraOpen && imageDataUrl && (
-              <div className="mt-3 flex items-center justify-between">
-                <span className={`text-xs truncate max-w-[220px] ${isDark ? 'text-zinc-400' : 'text-slate-500'}`}>
-                  {fileName}
-                </span>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setImageDataUrl(null);
-                    setFileName('');
-                    setDetections([]);
-                  }}
-                  className="text-xs font-medium text-red-500 hover:text-red-400 cursor-pointer"
-                >
-                  Remove Photo
-                </button>
-              </div>
-            )}
+        <div className="results">
+          <div className="total">
+            <span>Total</span>
+            <strong>${total.toFixed(2)} CAD</strong>
           </div>
 
-          {/* Canadian Currency Breakdown Panel */}
-          <div
-            className={`lg:col-span-5 rounded-xl border p-5 ${
-              isDark ? 'bg-[#0d0d0d] border-zinc-800' : 'bg-white border-slate-200 shadow-sm'
-            }`}
-          >
-            <div
-              className={`flex items-center justify-between pb-3.5 border-b ${
-                isDark ? 'border-zinc-800' : 'border-slate-200'
-              }`}
-            >
-              <div>
-                <span className={`text-xs font-bold uppercase tracking-wider ${isDark ? 'text-zinc-400' : 'text-slate-500'}`}>
-                  Total CAD
-                </span>
-                <div className="text-3xl sm:text-4xl font-extrabold text-[#16a34a] tabular-nums mt-0.5">
-                  ${grandTotal.toFixed(2)}
+          {["Bill", "Coin"].map((type) => (
+            <div key={type}>
+              <h2>{type}s</h2>
+              {DENOMINATIONS.filter((item) => item.type === type).map((item) => (
+                <div className="count-row" key={item.id}>
+                  <span>{item.name}</span>
+                  <div>
+                    <button onClick={() => changeCount(item.id, -1)} aria-label={`Remove ${item.name}`}>−</button>
+                    <strong>{counts[item.id]}</strong>
+                    <button onClick={() => changeCount(item.id, 1)} aria-label={`Add ${item.name}`}>+</button>
+                  </div>
                 </div>
-              </div>
-
-              <button
-                type="button"
-                onClick={handleReset}
-                className={`px-3 py-1.5 rounded-lg border text-xs font-semibold flex items-center gap-1.5 cursor-pointer transition ${
-                  isDark
-                    ? 'bg-zinc-900 border-zinc-700 text-zinc-300 hover:bg-zinc-800'
-                    : 'bg-slate-100 border-slate-300 text-slate-700 hover:bg-slate-200'
-                }`}
-              >
-                <RotateCcw className="w-3.5 h-3.5" />
-                Reset
-              </button>
+              ))}
             </div>
+          ))}
 
-            {/* CAD Bills */}
-            <div className="mt-4">
-              <div className={`flex items-center justify-between text-xs font-semibold uppercase tracking-wider mb-2 ${isDark ? 'text-zinc-400' : 'text-slate-500'}`}>
-                <span>CAD Bills</span>
-                <span className="tabular-nums">${billsSubtotal.toFixed(2)}</span>
-              </div>
+          <button className="reset" onClick={resetCounts}>Reset count</button>
+        </div>
+      </section>
 
-              <div className="space-y-1.5">
-                {CAD_DENOMINATIONS.filter((d) => d.type === 'bill').map((item) => (
-                  <div
-                    key={item.id}
-                    className={`flex items-center justify-between px-2.5 py-1.5 rounded-lg text-sm ${
-                      isDark ? 'bg-zinc-900/80' : 'bg-slate-50'
-                    }`}
-                  >
-                    <div className="flex items-center gap-2">
-                      <span className={`px-2 py-0.5 rounded border text-xs font-bold tabular-nums ${item.accent}`}>
-                        {item.short}
-                      </span>
-                      <span className="font-medium">{item.label}</span>
-                    </div>
+      {message && <p className="message" role="status">{message}</p>}
 
-                    <div className="flex items-center gap-2">
-                      <button
-                        type="button"
-                        onClick={() => adjustCount(item.id, -1)}
-                        className={`w-6 h-6 rounded flex items-center justify-center cursor-pointer transition ${
-                          isDark ? 'bg-zinc-800 hover:bg-zinc-700 text-zinc-300' : 'bg-slate-200 hover:bg-slate-300 text-slate-700'
-                        }`}
-                      >
-                        <Minus className="w-3.5 h-3.5" />
-                      </button>
-                      <span className="w-6 text-center font-bold tabular-nums">{counts[item.id] || 0}</span>
-                      <button
-                        type="button"
-                        onClick={() => adjustCount(item.id, 1)}
-                        className="w-6 h-6 rounded bg-[#16a34a]/20 hover:bg-[#16a34a] text-[#16a34a] hover:text-white flex items-center justify-center cursor-pointer transition"
-                      >
-                        <Plus className="w-3.5 h-3.5" />
-                      </button>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </div>
-
-            {/* CAD Coins */}
-            <div className={`mt-5 pt-4 border-t ${isDark ? 'border-zinc-800' : 'border-slate-200'}`}>
-              <div className={`flex items-center justify-between text-xs font-semibold uppercase tracking-wider mb-2 ${isDark ? 'text-zinc-400' : 'text-slate-500'}`}>
-                <span>CAD Coins</span>
-                <span className="tabular-nums">${coinsSubtotal.toFixed(2)}</span>
-              </div>
-
-              <div className="space-y-1.5">
-                {CAD_DENOMINATIONS.filter((d) => d.type === 'coin').map((item) => (
-                  <div
-                    key={item.id}
-                    className={`flex items-center justify-between px-2.5 py-1.5 rounded-lg text-sm ${
-                      isDark ? 'bg-zinc-900/80' : 'bg-slate-50'
-                    }`}
-                  >
-                    <div className="flex items-center gap-2">
-                      <span className={`px-2 py-0.5 rounded border text-xs font-bold tabular-nums ${item.accent}`}>
-                        {item.short}
-                      </span>
-                      <span className="font-medium">{item.label}</span>
-                    </div>
-
-                    <div className="flex items-center gap-2">
-                      <button
-                        type="button"
-                        onClick={() => adjustCount(item.id, -1)}
-                        className={`w-6 h-6 rounded flex items-center justify-center cursor-pointer transition ${
-                          isDark ? 'bg-zinc-800 hover:bg-zinc-700 text-zinc-300' : 'bg-slate-200 hover:bg-slate-300 text-slate-700'
-                        }`}
-                      >
-                        <Minus className="w-3.5 h-3.5" />
-                      </button>
-                      <span className="w-6 text-center font-bold tabular-nums">{counts[item.id] || 0}</span>
-                      <button
-                        type="button"
-                        onClick={() => adjustCount(item.id, 1)}
-                        className="w-6 h-6 rounded bg-[#16a34a]/20 hover:bg-[#16a34a] text-[#16a34a] hover:text-white flex items-center justify-center cursor-pointer transition"
-                      >
-                        <Plus className="w-3.5 h-3.5" />
-                      </button>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </div>
-          </div>
-        </section>
+      {detections.length > 0 && (
+        <p className="hint">
+          Detected items: {detections.map((item) => `${item.className} (${Math.round(item.score * 100)}%)`).join(", ")}
+        </p>
+      )}
       </main>
-    </div>
+    </>
   );
 }
