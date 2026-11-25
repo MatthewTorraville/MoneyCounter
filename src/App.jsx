@@ -337,10 +337,13 @@ export default function App() {
   const [detections, setDetections] = useState([]);
   const [message, setMessage] = useState("");
   const [busy, setBusy] = useState(false);
+  const [cameraOpen, setCameraOpen] = useState(false);
 
   const imageRef = useRef(null);
   const fileRef = useRef(null);
   const captureRef = useRef(null);
+  const videoRef = useRef(null);
+  const streamRef = useRef(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -359,6 +362,60 @@ export default function App() {
 
     return () => { cancelled = true; };
   }, []);
+
+  useEffect(() => {
+    return () => {
+      streamRef.current?.getTracks().forEach((track) => track.stop());
+    };
+  }, []);
+
+  function stopCamera() {
+    streamRef.current?.getTracks().forEach((track) => track.stop());
+    streamRef.current = null;
+    setCameraOpen(false);
+  }
+
+  async function openCamera() {
+    if (!navigator.mediaDevices?.getUserMedia) {
+      captureRef.current?.click();
+      return;
+    }
+
+    setMessage("");
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: "environment" } },
+        audio: false,
+      });
+      streamRef.current = stream;
+      setCameraOpen(true);
+      requestAnimationFrame(() => {
+        if (videoRef.current) {
+          videoRef.current.srcObject = stream;
+          videoRef.current.play().catch(() => {});
+        }
+      });
+    } catch {
+      captureRef.current?.click();
+    }
+  }
+
+  function snapPhoto() {
+    const video = videoRef.current;
+    if (!video || !video.videoWidth || !video.videoHeight) return;
+
+    const canvas = document.createElement("canvas");
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    canvas.getContext("2d").drawImage(video, 0, 0);
+
+    canvas.toBlob((blob) => {
+      stopCamera();
+      if (!blob) return;
+      const snappedFile = new File([blob], "camera-photo.jpg", { type: "image/jpeg" });
+      choosePhoto(snappedFile);
+    }, "image/jpeg", 0.92);
+  }
 
   function choosePhoto(file) {
     if (!file || !file.type.startsWith("image/")) {
@@ -432,7 +489,7 @@ export default function App() {
   return (
     <>
       <style>{`
-        * { box-sizing: border-box; }
+- { box-sizing: border-box; }
         body {
           margin: 0;
           min-height: 100vh;
@@ -538,11 +595,26 @@ export default function App() {
           }}
         />
         <button onClick={() => fileRef.current?.click()}>Choose photo</button>
-        <button onClick={() => captureRef.current?.click()}>Capture photo</button>
+        <button onClick={openCamera}>Capture photo</button>
         <button onClick={countMoney} disabled={!model || !photo || busy}>
           {busy ? "Counting…" : "Count money"}
         </button>
       </section>
+
+      {cameraOpen && (
+        <div className="preview" style={{ marginBottom: 14 }}>
+          <video
+            ref={videoRef}
+            playsInline
+            muted
+            style={{ maxWidth: "100%", maxHeight: 400, borderRadius: 4 }}
+          />
+          <div className="controls" style={{ marginTop: 10, marginBottom: 0 }}>
+            <button onClick={snapPhoto}>Snap photo</button>
+            <button onClick={stopCamera}>Cancel</button>
+          </div>
+        </div>
+      )}
 
       <section className="workspace">
         <div className="preview">
