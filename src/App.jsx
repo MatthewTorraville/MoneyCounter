@@ -5,7 +5,7 @@ import * as tflite from "@tensorflow/tfjs-tflite";
 //Yes we shoved this whole project into one "small" dinky file
 const MODEL_URL = "/models/cad_money.tflite";
 const INPUT_SIZE = 640;
-const SCORE_THRESHOLD = 0.1;
+const SCORE_THRESHOLD = 0.30;
 const IOU_THRESHOLD = 0.45;
 
 const DENOMINATIONS = [
@@ -617,6 +617,8 @@ export default function App() {
         </div>
       )}
 
+      {message && <p className="message" role="status">{message}</p>}
+
       <section className="workspace">
         <div className="preview">
           {photo ? (
@@ -687,7 +689,6 @@ export default function App() {
         </div>
       </section>
 
-      {message && <p className="message" role="status">{message}</p>}
 
       {detections.length > 0 && (
         <p className="hint">
