@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import * as tf from "@tensorflow/tfjs";
 import * as tflite from "@tensorflow/tfjs-tflite";
 
+//Yes we shoved this whole project into one "small" dinky file
 const MODEL_URL = "/models/cad_money.tflite";
 const INPUT_SIZE = 640;
 const SCORE_THRESHOLD = 0.1;
@@ -169,7 +170,7 @@ function decodeOutput(tensor, image) {
     let x1, y1, x2, y2, score, classId;
 
     if (sixColumns) {
-      // Assumes rows are [x1, y1, x2, y2, confidence, classId].
+      // rows are [x1, y1, x2, y2, confidence, classId].
       x1 = read(i, 0);
       y1 = read(i, 1);
       x2 = read(i, 2);
@@ -177,7 +178,7 @@ function decodeOutput(tensor, image) {
       score = read(i, 4);
       classId = Math.round(read(i, 5));
     } else {
-      // Assumes YOLO rows are [centerX, centerY, width, height, 10 class scores].
+      // rows are [centerX, centerY, width, height, 10 class scores].
       const centerX = read(i, 0);
       const centerY = read(i, 1);
       const boxWidth = read(i, 2);
@@ -215,7 +216,7 @@ function decodeOutput(tensor, image) {
       y2 *= INPUT_SIZE;
     }
 
-    // Remove the letterbox padding and map boxes to the original photo.
+    // Remove the letterbox padding and stuff
     const left = Math.max(0, Math.min(image.width, (x1 - image.padX) / image.scale));
     const top = Math.max(0, Math.min(image.height, (y1 - image.padY) / image.scale));
     const right = Math.max(0, Math.min(image.width, (x2 - image.padX) / image.scale));
@@ -305,8 +306,7 @@ async function detectMoney(model, source) {
       );
     }
 
-    // Some exports add extra dimensions, such as [1, 1, N, 6].
-    // Remove singleton dimensions until the output is three-dimensional.
+    // Math mmm
     while (result.shape.length > 3) {
       const axis = result.shape.findIndex((size, index) => index > 0 && size === 1);
       if (axis === -1) {
@@ -486,6 +486,7 @@ export default function App() {
     0
   );
 
+  //Buncha styling below, sorry for the mess Dawid.
   return (
     <>
       <style>{`
